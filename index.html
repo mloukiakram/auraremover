@@ -439,8 +439,10 @@
             el('undo-btn').disabled = !lastActionState;
         }
 
-        // --- NEW --- Function to parse vMTA/number from SOURCE line
-        const sourceLineRegex = /^(.*)-(\w+)-([\w-]+)-(\d+)$/;
+        // --- ★★★ BUG FIX HERE ★★★ ---
+        // The regex was changed from (.*) to (.*?) to make the first group non-greedy.
+        // This stops it from consuming the vMTA part of the string.
+        const sourceLineRegex = /^(.*?)-(\w+)-([\w-]+)-(\d+)$/;
         function parseSourceLine(line, index) {
             const match = line.trim().match(sourceLineRegex);
             if (match) {
@@ -553,13 +555,13 @@
                 for (const numToFilter of filterData) {
                     const numStr = String(numToFilter);
                     const matches = parsedSourceLines.filter(l => l && l.number === numStr);
-                    if (matches.length === 0) continue;
+                    if (matches.length === 0) continue; // No lines with this number
 
                     const vmtas = new Set(matches.map(l => l.vmta).filter(Boolean)); // Get unique, non-null vMTAs
                     let vmtaToProcess = 'all';
 
                     if (vmtas.size > 1) {
-                        // More than one vMTA uses this number, show modal
+                        // AMBIGUOUS! Show modal.
                         vmtaToProcess = await askVmtaChoice(numStr, Array.from(vmtas));
                         if (vmtaToProcess === 'cancel') continue; // Skip this number
                     }
