@@ -439,10 +439,11 @@
             el('undo-btn').disabled = !lastActionState;
         }
 
-        // --- ★★★ BUG FIX HERE ★★★ ---
-        // The regex was changed from (.*) to (.*?) to make the first group non-greedy.
-        // This stops it from consuming the vMTA part of the string.
-        const sourceLineRegex = /^(.*?)-(\w+)-([\w-]+)-(\d+)$/;
+        // --- ★★★ THE REAL BUG FIX IS HERE ★★★ ---
+        // Changed (\w+) to ([a-zA-Z]+) to ensure we only match letters for the vMTA
+        // and don't accidentally match the numeric ID.
+        const sourceLineRegex = /^(.*?)-([a-zA-Z]+)-([\w-]+)-(\d+)$/;
+        
         function parseSourceLine(line, index) {
             const match = line.trim().match(sourceLineRegex);
             if (match) {
@@ -450,9 +451,9 @@
                     line: line, 
                     index: index, 
                     fullPrefix: match[1], 
-                    vmta: match[2], 
-                    id: match[3], 
-                    number: match[4] 
+                    vmta: match[2], // This will now correctly be "bt" or "sky"
+                    id: match[3],     // This will be "1818"
+                    number: match[4]  // This will be "112" or "1"
                 };
             }
             // Fallback for lines that don't match the vMTA format but might end in a number
