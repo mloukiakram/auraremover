@@ -184,6 +184,34 @@
             font-family: var(--font-main);
         }
         .form-group textarea { font-family: var(--font-mono); }
+        
+        /* --- NEW vMTA MODAL STYLES --- */
+        #vmta-modal-choices {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            max-height: 200px;
+            overflow-y: auto;
+            padding: 0.5rem;
+            background: var(--bg-main);
+            border-radius: 0.5rem;
+        }
+        #vmta-modal-choices label {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            border-radius: 0.375rem;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        #vmta-modal-choices label:hover {
+            background-color: #e9ecef;
+        }
+        #vmta-modal-choices input[type="radio"] {
+            width: 18px;
+            height: 18px;
+        }
     </style>
 </head>
 <body>
@@ -291,6 +319,21 @@
             </div>
         </div>
     </div>
+
+    <div class="modal-overlay" id="vmtaModalOverlay">
+        <div class="modal">
+            <h3 id="vmta-modal-title">Ambiguous Number</h3>
+            <p id="vmta-modal-message"></p>
+            <div class="form-group">
+                <div id="vmta-modal-choices">
+                    </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn secondary" id="vmtaModalCancel">Cancel</button>
+                <button type="button" class="btn primary" id="vmtaModalConfirm">Confirm</button>
+            </div>
+        </div>
+    </div>
     
     <script>
         // --- CANVAS BACKGROUND ANIMATION ---
@@ -372,15 +415,17 @@
         let savedLists = [];
         let currentLoadedListId = null;
         let lastActionState = null;
-
         let state = { mode: 'delete', filterBy: 'number' };
+        
+        // --- NEW --- vMTA Modal Promise Resolver
+        let vmtaModalResolve = null;
 
         function updateUI() {
             el('mode-delete').classList.toggle('active', state.mode === 'delete');
             el('mode-keep').classList.toggle('active', state.mode === 'keep');
             el('filter-by-number').classList.toggle('active', state.filterBy === 'number');
             el('filter-by-keyword').classList.toggle('active', state.filterBy === 'keyword');
-            const filterText = state.filterBy === 'number' ? 'Line Numbers' : 'Keywords';
+            const filterText = state.filterBy === 'number' ? 'Suffix Numbers' : 'Keywords'; // Changed label
             el('raw-data-label').textContent = `2. ${filterText} to Process`;
             const processBtn = el('process-btn');
             const actionText = state.mode === 'delete' ? 'Delete' : 'Keep';
@@ -394,11 +439,34 @@
             el('undo-btn').disabled = !lastActionState;
         }
 
+        // --- NEW --- Function to parse vMTA/number from SOURCE line
+        const sourceLineRegex = /^(.*)-(\w+)-([\w-]+)-(\d+)$/;
+        function parseSourceLine(line, index) {
+            const match = line.trim().match(sourceLineRegex);
+            if (match) {
+                return { 
+                    line: line, 
+                    index: index, 
+                    fullPrefix: match[1], 
+                    vmta: match[2], 
+                    id: match[3], 
+                    number: match[4] 
+                };
+            }
+            // Fallback for lines that don't match the vMTA format but might end in a number
+            const numMatch = line.trim().match(/(\d+)$/);
+            if (numMatch) {
+                return { line: line, index: index, vmta: null, number: numMatch[1] };
+            }
+            return { line: line, index: index, vmta: null, number: null };
+        }
+
         function parseFilterData() {
             const rawText = el('rawDataInput').value;
             if (state.filterBy === 'keyword') {
                 return rawText.split('\n').map(k => k.trim().toLowerCase()).filter(Boolean);
             }
+            // For 'number' mode, parse numbers robustly
             const cleanedText = rawText.replace(/,/g, '\n');
             const lines = cleanedText.split('\n');
             const numbers = new Set();
@@ -407,6 +475,7 @@
                 if (/^\d+$/.test(trimmed)) {
                     numbers.add(parseInt(trimmed, 10));
                 } else {
+                    // Also check if user pasted a full line like ...-bt-1818-112
                     const parts = trimmed.split(/[\s-]+/);
                     const lastPart = parts[parts.length - 1];
                     if (/^\d+$/.test(lastPart)) {
@@ -417,31 +486,124 @@
             return Array.from(numbers).sort((a, b) => a - b);
         }
 
-        function processAndShow() {
+        // --- NEW --- Function to show vMTA choice modal
+        function askVmtaChoice(number, vmtas) {
+            return new Promise(resolve => {
+                vmtaModalResolve = resolve; // Store the resolver
+                el('vmta-modal-title').textContent = `Ambiguous Number: "${number}"`;
+                el('vmta-modal-message').textContent = `This number is used by multiple vMTAs. Please choose which ones to ${state.mode}.`;
+                const choicesContainer = el('vmta-modal-choices');
+                choicesContainer.innerHTML = ''; // Clear old choices
+
+                // Add "All" option
+                choicesContainer.innerHTML += `
+                    <label>
+                        <input type="radio" name="vmta-choice" value="all" checked>
+                        <strong>All of them (${vmtas.length})</strong>
+                    </label>`;
+                
+                // Add specific vMTA options
+                vmtas.forEach(vmta => {
+                    choicesContainer.innerHTML += `
+                        <label>
+                            <input type="radio" name="vmta-choice" value="${vmta}">
+                            <span>${vmta}</span>
+                        </label>`;
+                });
+                
+                el('vmtaModalOverlay').classList.add('show');
+            });
+        }
+
+        // --- MODIFIED --- Main processing function is now ASYNC
+        async function processAndShow() {
             const filterData = parseFilterData();
             if (filterData.length === 0) { showToast("Filter data is empty. Nothing to process.", "warning"); return; }
+            
             const sourceLines = el('lineListInput').value.split('\n');
-            const resultLines = [];
+            const parsedSourceLines = sourceLines.map(parseSourceLine);
+            
+            let resultLines = [];
             const logDetails = [];
+            
             if (currentLoadedListId) {
                 const listIndex = savedLists.findIndex(l => l.id === currentLoadedListId);
                 if (listIndex > -1) { lastActionState = { listId: currentLoadedListId, previousContent: savedLists[listIndex].content }; }
             } else { lastActionState = null; }
-            sourceLines.forEach((line, index) => {
-                const currentLineNumber = index + 1;
-                const lineContentLower = line.trim().toLowerCase();
-                let shouldProcess = false;
-                if (state.filterBy === 'number') { shouldProcess = filterData.includes(currentLineNumber); } 
-                else { shouldProcess = filterData.some(keyword => lineContentLower.includes(keyword)); }
-                const keepLine = (state.mode === 'keep' && shouldProcess) || (state.mode === 'delete' && !shouldProcess);
-                if (keepLine) {
-                    resultLines.push(line);
-                    logDetails.push(`Line ${currentLineNumber}: Kept     -> "${line.trim()}"`);
-                } else {
-                    const logAction = state.mode === 'delete' ? 'DELETED' : 'Discarded';
-                    logDetails.push(`Line ${currentLineNumber}: ${logAction} -> "${line.trim()}"`);
+
+            if (state.filterBy === 'keyword') {
+                // --- Original KEYWORD logic (unchanged) ---
+                sourceLines.forEach((line, index) => {
+                    const lineContentLower = line.trim().toLowerCase();
+                    let shouldProcess = filterData.some(keyword => lineContentLower.includes(keyword));
+                    const keepLine = (state.mode === 'keep' && shouldProcess) || (state.mode === 'delete' && !shouldProcess);
+                    if (keepLine) {
+                        resultLines.push(line);
+                        logDetails.push(`Line ${index + 1}: Kept     -> "${line.trim()}"`);
+                    } else {
+                        const logAction = state.mode === 'delete' ? 'DELETED' : 'Discarded';
+                        logDetails.push(`Line ${index + 1}: ${logAction} -> "${line.trim()}"`);
+                    }
+                });
+            } else {
+                // --- NEW NUMBER logic (with vMTA support) ---
+                const linesToKeep = new Set(sourceLines);
+                const linesToKeepExplicitly = new Set();
+                
+                for (const numToFilter of filterData) {
+                    const numStr = String(numToFilter);
+                    const matches = parsedSourceLines.filter(l => l && l.number === numStr);
+                    if (matches.length === 0) continue;
+
+                    const vmtas = new Set(matches.map(l => l.vmta).filter(Boolean)); // Get unique, non-null vMTAs
+                    let vmtaToProcess = 'all';
+
+                    if (vmtas.size > 1) {
+                        // More than one vMTA uses this number, show modal
+                        vmtaToProcess = await askVmtaChoice(numStr, Array.from(vmtas));
+                        if (vmtaToProcess === 'cancel') continue; // Skip this number
+                    }
+
+                    // Process all matching lines based on modal choice
+                    for (const match of matches) {
+                        const processThisLine = (vmtaToProcess === 'all') || (match.vmta === vmtaToProcess);
+                        
+                        if (processThisLine) {
+                            if (state.mode === 'delete') {
+                                linesToKeep.delete(match.line);
+                                logDetails.push(`Line ${match.index + 1}: DELETED (vMTA: ${match.vmta || 'N/A'}, Num: ${numStr}) -> "${match.line.trim()}"`);
+                            } else { // mode === 'keep'
+                                linesToKeepExplicitly.add(match.line);
+                                logDetails.push(`Line ${match.index + 1}: Kept (vMTA: ${match.vmta || 'N/A'}, Num: ${numStr}) -> "${match.line.trim()}"`);
+                            }
+                        }
+                    }
                 }
-            });
+
+                // Finalize result list based on mode
+                if (state.mode === 'delete') {
+                    // For delete mode, log the lines that *were not* deleted
+                    parsedSourceLines.forEach(l => {
+                        if (linesToKeep.has(l.line)) {
+                            logDetails.push(`Line ${l.index + 1}: Kept     -> "${l.line.trim()}"`);
+                        }
+                    });
+                    resultLines = Array.from(linesToKeep);
+                } else { // mode === 'keep'
+                    // For keep mode, log the lines that *were not* explicitly kept
+                    parsedSourceLines.forEach(l => {
+                        if (!linesToKeepExplicitly.has(l.line)) {
+                            logDetails.push(`Line ${l.index + 1}: Discarded -> "${l.line.trim()}"`);
+                        }
+                    });
+                    resultLines = Array.from(linesToKeepExplicitly);
+                }
+                
+                // Sort log by line number
+                logDetails.sort((a, b) => parseInt(a.split(' ')[1]) - parseInt(b.split(' ')[1]));
+            }
+
+            // --- Finish up (unchanged) ---
             const finalContent = resultLines.join('\n');
             let updateMessage = "";
             if (currentLoadedListId) {
@@ -454,7 +616,20 @@
                 }
             }
             el('finalResultOutput').value = finalContent;
-            el('logOutput').value = [ `--- PROCESSING SUMMARY ---`, `Action: ${state.mode.toUpperCase()} lines based on ${filterData.length} ${state.filterBy}(s).`, `Lines Kept: ${resultLines.length}`, `Lines Removed: ${sourceLines.length - resultLines.length}`, updateMessage, `\n--- DETAILED LOG ---`, ...logDetails ].join('\n').trim();
+            const summaryAction = state.mode === 'delete' ? 'Removed' : 'Kept';
+            const summaryRemoved = state.mode === 'delete' ? (sourceLines.length - resultLines.length) : (sourceLines.length - resultLines.length);
+            const summaryKept = resultLines.length;
+
+            el('logOutput').value = [ 
+                `--- PROCESSING SUMMARY ---`, 
+                `Action: ${state.mode.toUpperCase()} lines based on ${filterData.length} ${state.filterBy}(s).`, 
+                `Lines Kept: ${summaryKept}`, 
+                `Lines Removed: ${summaryRemoved}`, 
+                updateMessage, 
+                `\n--- DETAILED LOG ---`, 
+                ...logDetails 
+            ].join('\n').trim();
+            
             if (currentLoadedListId) renderListTable();
             updateUI();
         }
@@ -502,7 +677,7 @@
 
         function updateLineCount(textarea, counter) {
             const text = textarea.value;
-            const lineCount = text ? text.split('\n').length : 0;
+            const lineCount = text ? text.split('\n').filter(Boolean).length : 0; // Count non-empty lines
             counter.textContent = `${lineCount} line${lineCount !== 1 ? 's' : ''}`;
         }
         
@@ -598,8 +773,6 @@
             sourceInput.addEventListener('input', () => {
                 updateLineCount(sourceInput, sourceCounter);
                 if (currentLoadedListId) {
-                    // If user edits a loaded list, switch to manual mode
-                    // to prevent accidental overwrites on the next run.
                     currentLoadedListId = null;
                     renderListTable();
                     updateUI();
@@ -614,6 +787,24 @@
             el('listModalCancel').addEventListener('click', () => el('listModalOverlay').classList.remove('show'));
             el('deleteModalConfirm').addEventListener('click', executeDelete);
             el('deleteModalCancel').addEventListener('click', () => el('deleteConfirmModalOverlay').classList.remove('show'));
+            
+            // --- NEW --- vMTA Modal Listeners
+            el('vmtaModalConfirm').addEventListener('click', () => {
+                const choice = document.querySelector('input[name="vmta-choice"]:checked').value;
+                el('vmtaModalOverlay').classList.remove('show');
+                if (vmtaModalResolve) {
+                    vmtaModalResolve(choice);
+                    vmtaModalResolve = null;
+                }
+            });
+            el('vmtaModalCancel').addEventListener('click', () => {
+                el('vmtaModalOverlay').classList.remove('show');
+                if (vmtaModalResolve) {
+                    vmtaModalResolve('cancel'); // Resolve with 'cancel'
+                    vmtaModalResolve = null;
+                }
+            });
+
             el('saved-lists-table-body').addEventListener('click', (event) => {
                 const button = event.target.closest('button[data-action]'); if (!button) return;
                 const listId = parseInt(button.dataset.id); const action = button.dataset.action;
@@ -634,4 +825,3 @@
     </script>
 </body>
 </html>
-
